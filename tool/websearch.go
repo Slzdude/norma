@@ -8,10 +8,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/norma/permission"
+	"github.com/Slzdude/norma/permission"
 	"golang.org/x/net/html"
 )
 
@@ -38,6 +39,10 @@ type WebSearchConfig struct {
 	// Search API, needs TavilyAPIKey), or "deepseek" (DeepSeek's server-side
 	// web search, needs DeepSeek*). Empty defaults to "ddgs".
 	Backend string
+	// SearXNGEndpoint 配置 "searxng" 后端的实例位（本地 SearXNG 实例缺省
+	// http://127.0.0.1:8888）；环回地址放宽的取舍注记见 websearch_searxng.go。
+	SearXNGEndpoint string
+
 	// BraveAPIKey authenticates the "brave-free" backend. Required (and only
 	// used) when Backend == "brave-free".
 	BraveAPIKey string
@@ -108,6 +113,17 @@ func newSearchProvider(cfg WebSearchConfig) (searchProvider, error) {
 	}
 	client := newFetchClient(WebFetchConfig{Proxy: cfg.Proxy, CACert: cfg.CACert, InsecureTLS: cfg.InsecureTLS})
 	switch backend {
+	case "searxng":
+		// endpoint 取值链：cfg → env NORMA_SEARXNG_ENDPOINT（config 桥，见
+		// websearch_searxng.go 注记——不动 agentcore 上游 options 契约形）→ 缺省。
+		endpoint := strings.TrimSpace(cfg.SearXNGEndpoint)
+		if endpoint == "" {
+			endpoint = strings.TrimSpace(os.Getenv("NORMA_SEARXNG_ENDPOINT"))
+		}
+		if endpoint == "" {
+			endpoint = searxngEndpointDefault
+		}
+		return &searxngProvider{client: client, endpoint: endpoint}, nil
 	case "ddgs":
 		return &ddgsProvider{client: client, endpoint: ddgsEndpoint}, nil
 	case "brave-free":
@@ -221,7 +237,7 @@ func (p *ddgsProvider) Search(ctx context.Context, query string, limit int) ([]S
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	// A browser-like UA — the endpoint blocks obviously-automated clients.
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+	req.Header.Set("User-Agent", HTTPUserAgent) // 单源=DefaultHTTPUserAgent（浏览器伪装）
 	req.Header.Set("Referer", "https://html.duckduckgo.com/")
 	resp, err := p.client.Do(req)
 	if err != nil {

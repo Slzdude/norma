@@ -108,7 +108,7 @@ func (s *Store) Save(m Memory) error {
 		return fmt.Errorf("memory: name is required")
 	}
 	path := filepath.Join(s.Dir, slug(m.Name)+".md")
-	if err := os.WriteFile(path, []byte(renderFrontmatter(m)), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(renderFrontmatter(m)), 0o600); err != nil {
 		return err
 	}
 	return s.rebuildIndex()
@@ -124,7 +124,7 @@ func (s *Store) Index() string {
 }
 
 func (s *Store) rebuildIndex() error {
-	return os.WriteFile(filepath.Join(s.Dir, indexFile), []byte(s.buildIndex()), 0o644)
+	return os.WriteFile(filepath.Join(s.Dir, indexFile), []byte(s.buildIndex()), 0o600)
 }
 
 func (s *Store) buildIndex() string {

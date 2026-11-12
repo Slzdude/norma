@@ -181,7 +181,7 @@ func runWrite(_ context.Context, input json.RawMessage, tc *ToolContext) (Result
 			return Errorf(fmt.Sprintf("Error creating directory: %v", err)), nil
 		}
 	}
-	if err := os.WriteFile(path, []byte(in.Content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(in.Content), 0o600); err != nil {
 		return Errorf(fmt.Sprintf("Error writing %s: %v", in.FilePath, err)), nil
 	}
 	verb := "Created"
@@ -243,7 +243,7 @@ func runEdit(_ context.Context, input json.RawMessage, tc *ToolContext) (Result,
 	} else {
 		updated = strings.Replace(content, in.OldString, in.NewString, 1)
 	}
-	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(updated), 0o600); err != nil {
 		return Errorf(fmt.Sprintf("Error writing %s: %v", in.FilePath, err)), nil
 	}
 	return Text(fmt.Sprintf("Edited %s (%d replacement(s))", in.FilePath, count)), nil

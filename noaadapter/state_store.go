@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/Autumn-27/norma/noa"
+	"github.com/Slzdude/norma/noa"
 )
 
 // stateFileVersion guards against silently misreading a future format.
@@ -168,7 +168,7 @@ func (s *StateStore) writeAtomic(st noa.CompressionState) error {
 		os.Remove(name)
 		return fmt.Errorf("close state: %w", err)
 	}
-	if err := os.Chmod(name, 0o644); err != nil {
+	if err := os.Chmod(name, 0o600); err != nil {
 		os.Remove(name)
 		return err
 	}

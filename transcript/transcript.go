@@ -30,7 +30,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Slzdude/norma/llm"
 )
 
 // Record is one line of a JSONL transcript.
@@ -77,7 +77,7 @@ func (s *Store) Append(path string, recs ...Record) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}

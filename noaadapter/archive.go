@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/Autumn-27/norma/noa"
+	"github.com/Slzdude/norma/noa"
 )
 
 // fileArchiver writes archives under <root>/tier<N>/.
@@ -48,7 +48,7 @@ func (a *fileArchiver) Write(tier noa.Tier, blockID, startRef, endRef string, co
 		os.Remove(tmpName)
 		return "", "", fmt.Errorf("close archive: %w", err)
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
+	if err := os.Chmod(tmpName, 0o600); err != nil {
 		os.Remove(tmpName)
 		return "", "", fmt.Errorf("chmod archive: %w", err)
 	}

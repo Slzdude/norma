@@ -14,9 +14,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/norma/permission"
+	"github.com/Slzdude/norma/permission"
 	"golang.org/x/net/html"
 )
+
+// DefaultHTTPUserAgent 是 WebFetch/WebSearch 目标面出站 UA 缺省：浏览器伪装
+// （与 websearch 一致）。硬编码工具名会把 UA 变成工具链指纹——目标侧可识别、
+// 易被特征拦截，因此缺省改为浏览器伪装。
+// 可配置面：agent.http_user_agent（config.json）/ NORMA_HTTP_USER_AGENT（env 优先），
+// 由宿主启动时注入 HTTPUserAgent。
+const DefaultHTTPUserAgent = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+// HTTPUserAgent 是出站目标面 User-Agent 单源（包级可注入=配置面钩子）。
+var HTTPUserAgent = DefaultHTTPUserAgent
 
 // WebFetchConfig tunes the network behavior of a WebFetch tool.
 type WebFetchConfig struct {
@@ -185,14 +195,14 @@ func webFetchRunner(cfg WebFetchConfig) func(context.Context, json.RawMessage, *
 		if err != nil {
 			return Errorf("Error: " + err.Error()), nil
 		}
-		req.Header.Set("user-agent", "norma/0.4")
+		req.Header.Set("user-agent", HTTPUserAgent)
 		resp, err := client.Do(req)
 		// One direct retry when the proxied attempt failed for a proxy-caused reason.
 		// A non-proxy error (bad host, caller timeout/cancel) is returned as-is — a
 		// direct retry wouldn't fix it. The direct response is NOT captured by the proxy.
 		if err != nil && direct != nil && proxyLikelyErr(err) {
 			if r2, e2 := http.NewRequestWithContext(cctx, http.MethodGet, in.URL, nil); e2 == nil {
-				r2.Header.Set("user-agent", "norma/0.4")
+				r2.Header.Set("user-agent", HTTPUserAgent)
 				if resp2, err2 := direct.Do(r2); err2 == nil {
 					resp, err = resp2, nil
 				} else {
