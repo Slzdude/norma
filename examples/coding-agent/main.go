@@ -23,13 +23,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/norma/agentcore"
-	"github.com/Autumn-27/norma/compaction"
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/hook"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/Slzdude/norma/agentcore"
+	"github.com/Slzdude/norma/compaction"
+	"github.com/Slzdude/norma/harness"
+	"github.com/Slzdude/norma/hook"
+	"github.com/Slzdude/norma/llm"
+	"github.com/Slzdude/norma/permission"
+	"github.com/Slzdude/norma/tool"
 )
 
 func main() {

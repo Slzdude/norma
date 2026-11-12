@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/noa"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/Slzdude/norma/llm"
+	"github.com/Slzdude/norma/noa"
+	"github.com/Slzdude/norma/tool"
 )
 
 // compress runs one Compress call and returns the panel.

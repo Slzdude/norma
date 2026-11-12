@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
+	"github.com/Slzdude/norma/llm"
 )
 
 // captureProvider records each request and yields a scripted reply, optionally

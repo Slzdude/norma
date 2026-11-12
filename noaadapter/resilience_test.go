@@ -9,8 +9,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/noa"
+	"github.com/Slzdude/norma/llm"
+	"github.com/Slzdude/norma/noa"
 )
 
 // buildWorkingSession runs a cooperative session far enough to have real blocks,

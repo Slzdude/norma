@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/Slzdude/norma/llm"
+	"github.com/Slzdude/norma/permission"
+	"github.com/Slzdude/norma/tool"
 )
 
 func maxTokensTurn(text string) []llm.StreamEvent {

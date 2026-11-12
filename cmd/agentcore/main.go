@@ -15,11 +15,11 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/Autumn-27/norma/agentcore"
-	"github.com/Autumn-27/norma/harness"
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/Slzdude/norma/agentcore"
+	"github.com/Slzdude/norma/harness"
+	"github.com/Slzdude/norma/llm"
+	"github.com/Slzdude/norma/permission"
+	"github.com/Slzdude/norma/tool"
 )
 
 // The SDK injects no system prompt, so this host supplies one. Swap it (or use

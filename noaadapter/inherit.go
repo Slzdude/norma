@@ -3,7 +3,7 @@ package noaadapter
 import (
 	"path/filepath"
 
-	"github.com/Autumn-27/norma/noa"
+	"github.com/Slzdude/norma/noa"
 )
 
 // maxInheritDepth bounds the walk up the parent chain. Deep enough for any real
