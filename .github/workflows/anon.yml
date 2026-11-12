@@ -1,0 +1,25 @@
+# 隐私与匿名守护 —— 随仓库分发，push / PR 强制。
+#
+# 敏感词表**不入库**：由 CI secret 注入 NORMA_REDACT_TERMS_FILE，
+# 或本地以 NORMA_REDACT_TERMS 提供。把「我们在藏什么」写进被守护的仓库，
+# 等于公开它。
+name: anon-guard
+on:
+  push:
+  pull_request:
+jobs:
+  anon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 隐私与匿名守护
+        env:
+          NORMA_REDACT_TERMS_FILE: ${{ secrets.NORMA_REDACT_TERMS_FILE }}
+        run: bash scripts/check-anon.sh
+      - name: 构建与测试
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./... -count=1
