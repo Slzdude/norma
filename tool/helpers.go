@@ -94,7 +94,7 @@ func spillOutput(dir, s string) (string, error) {
 		return "", err
 	}
 	name := fmt.Sprintf("output-%d-%d.txt", time.Now().Unix(), spillSeq.Add(1))
-	// 合并 v0.4.4：abs 绝对化（上游）+ 0o600 权限收紧（本仓 P2 凭据面）——双方增强并集。
+	// 权限收紧：0o600（最小权限）。
 	path := filepath.Join(abs, name)
 	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
 		return "", err

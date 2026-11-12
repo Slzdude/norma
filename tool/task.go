@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +55,22 @@ const (
 	// staleSessionTTL bounds how long another session's task directory survives
 	// before it is garbage-collected on the next Manager creation.
 	staleSessionTTL = 24 * time.Hour
+	// memSampleInterval is the watchdog cadence, shared by the output-size and
+	// memory guards.
+	memSampleInterval = 2 * time.Second
+	// fallbackMemCap is the memory cap used when the host's memory budget
+	// cannot be read at all (see defaultMemCap).
+	fallbackMemCap = 2 << 30 // 2 GiB
+	// minMemCap floors the derived cap: a tiny or misreported budget must not
+	// produce a cap that kills ordinary commands.
+	minMemCap = 512 << 20
+)
+
+// Termination reasons recorded by the watchdogs. An empty reason means a natural
+// exit or a manual Kill — both of which already speak for themselves.
+const (
+	terminateOversize = "oversize" // output file grew past maxTaskOutputBytes
+	terminateMemory   = "memory"   // process-group memory grew past the cap
 )
 
 // Task is a single background process tracked by a Manager. Its mutable fields
@@ -72,7 +90,7 @@ type Task struct {
 	// internal, guarded by Manager.mu
 	backgrounded bool // surfaced as a background task: notify on exit
 	notified     bool // completion already enqueued into pending
-	oversize     bool // terminated by the size watchdog
+	reason       string
 	cmd          *exec.Cmd
 	done         chan struct{} // closed by watch when the process exits
 }
@@ -80,7 +98,7 @@ type Task struct {
 func (t *Task) info() TaskInfo {
 	return TaskInfo{
 		ID: t.ID, Kind: t.Kind, Command: t.Command, Description: t.Description,
-		Status: t.Status, ExitCode: t.ExitCode,
+		Status: t.Status, ExitCode: t.ExitCode, Reason: t.reason,
 		StartTime: t.StartTime, EndTime: t.EndTime,
 		OutputPath: t.OutputPath, Backgrounded: t.backgrounded,
 	}
@@ -88,12 +106,15 @@ func (t *Task) info() TaskInfo {
 
 // TaskInfo is an immutable snapshot of a task for safe reads outside the lock.
 type TaskInfo struct {
-	ID           string
-	Kind         TaskKind
-	Command      string
-	Description  string
-	Status       TaskStatus
-	ExitCode     int
+	ID          string
+	Kind        TaskKind
+	Command     string
+	Description string
+	Status      TaskStatus
+	ExitCode    int
+	// Reason is the watchdog that terminated the task: terminateOversize or
+	// terminateMemory. Empty for a natural exit and for a manual Kill.
+	Reason       string
 	StartTime    time.Time
 	EndTime      time.Time
 	OutputPath   string
@@ -129,19 +150,75 @@ type SpawnSpec struct {
 	Kind        TaskKind
 	WorkingDir  string
 	// Env holds extra "KEY=VALUE" entries layered onto the process environment for
-	// this command (see ToolContext.Env). Empty = inherit unchanged.
+	// this command (see ToolContext.Env). Empty still applies nonInteractiveEnv.
 	Env []string
 }
 
-// withEnv returns the current process environment extended with extra
-// "KEY=VALUE" entries, or nil when extra is empty (child inherits unchanged).
-// os/exec dedups by key — case-insensitive on Windows, keeping the LAST
-// occurrence — so the appended entries override inherited ones on every OS.
+// nonInteractiveEnv are defaults every spawned shell gets, whether or not the
+// host passes any env of its own: a pager must never block a non-interactive
+// shell waiting for a terminal nobody is watching, and Debian package frontends
+// must never prompt. These deliberately override values inherited from the
+// agent's own process — an operator who exports PAGER=less for their shell would
+// otherwise hand every child a pager that hangs. A host that names the same key
+// explicitly still wins (see withEnv).
+var nonInteractiveEnv = []string{
+	"PAGER=cat",
+	"GIT_PAGER=cat",
+	"SYSTEMD_PAGER=cat",
+	"DEBIAN_FRONTEND=noninteractive",
+}
+
+// withEnv builds the child environment, in precedence order:
+//
+//	process environment  <  nonInteractiveEnv defaults  <  the host's extra vars
+//
+// Each layer is applied by DROPPING the earlier entry for that key rather than
+// appending a duplicate. os/exec's own dedup would resolve duplicates in favour
+// of the last occurrence, so appending alone would work for a child it spawns;
+// dropping makes the slice correct on its own terms, so it also reads correctly
+// anywhere it is inspected, logged, or handed to something that does not dedup.
+// (mcp/stdio.go relies on exec's last-wins dedup and is fine as it is.)
+//
+// The result is never nil — the defaults always apply.
 func withEnv(extra []string) []string {
-	if len(extra) == 0 {
-		return nil
+	extraKeys := make(map[string]bool, len(extra))
+	for _, kv := range extra {
+		if k := envKey(kv); k != "" {
+			extraKeys[k] = true
+		}
 	}
-	return append(os.Environ(), extra...)
+	drop := make(map[string]bool, len(extraKeys)+len(nonInteractiveEnv))
+	for k := range extraKeys {
+		drop[k] = true
+	}
+	for _, kv := range nonInteractiveEnv {
+		if k := envKey(kv); k != "" && !extraKeys[k] {
+			drop[k] = true
+		}
+	}
+	base := os.Environ()
+	out := make([]string, 0, len(base)+len(nonInteractiveEnv)+len(extra))
+	for _, kv := range base {
+		if k := envKey(kv); k != "" && drop[k] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	for _, kv := range nonInteractiveEnv {
+		if k := envKey(kv); k != "" && extraKeys[k] {
+			continue // host override wins
+		}
+		out = append(out, kv)
+	}
+	return append(out, extra...)
+}
+
+// envKey extracts the KEY of a "KEY=value" entry ("" when malformed).
+func envKey(kv string) string {
+	if i := strings.IndexByte(kv, '='); i > 0 {
+		return kv[:i]
+	}
+	return ""
 }
 
 // Manager owns the background tasks of one Session.
@@ -178,16 +255,33 @@ func NewManager(sessionID string) (*Manager, error) {
 	}
 	cleanStaleSessions(baseTaskDir(), sessionID)
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Manager{
+	m := &Manager{
 		tasks:      map[string]*Task{},
 		sessions:   map[string]*ptySession{},
 		dir:        dir,
 		rootCtx:    ctx,
 		rootCancel: cancel,
-	}, nil
+	}
+	// One memory watchdog for the whole manager, retired by Cleanup's
+	// rootCancel. A pass over zero running tasks costs nothing, so there is no
+	// reason to start it lazily.
+	if memGuardSupported {
+		go m.memGuard()
+	}
+	return m, nil
 }
 
-// cleanStaleSessions removes sibling session directories older than the TTL.
+// cleanStaleSessions removes sibling session directories older than the TTL —
+// those belong to sessions that died without running Cleanup (crash, SIGKILL).
+//
+// Staleness is judged by the NEWEST mtime in the directory, not the session
+// dir's own. MkdirAll stamps <base>/<sessionID> once and all writes land in
+// <sessionID>/tasks, so the session dir's mtime is frozen at creation and never
+// refreshed by activity: judging by it alone deletes a session that is alive and
+// busy but simply older than the TTL, out from under itself — Manager.Output
+// then fails with ENOENT and watchSize silently stops enforcing the output cap.
+// Output files are appended to as a task runs, so their mtimes are the signal
+// that something is still using this directory.
 func cleanStaleSessions(base, current string) {
 	entries, err := os.ReadDir(base)
 	if err != nil {
@@ -198,14 +292,48 @@ func cleanStaleSessions(base, current string) {
 		if !e.IsDir() || e.Name() == current {
 			continue
 		}
-		info, err := e.Info()
+		dir := filepath.Join(base, e.Name())
+		if newestMTime(dir).Before(cutoff) {
+			_ = os.RemoveAll(dir)
+		}
+	}
+}
+
+// newestMTime returns the most recent mtime of dir or anything one level below
+// it (<sessionID>/tasks and the output files inside). One level is enough: the
+// layout is fixed at <base>/<sessionID>/tasks/<file>.
+func newestMTime(dir string) time.Time {
+	var newest time.Time
+	bump := func(t time.Time) {
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	if fi, err := os.Stat(dir); err == nil {
+		bump(fi.ModTime())
+	}
+	subs, err := os.ReadDir(dir)
+	if err != nil {
+		return newest
+	}
+	for _, s := range subs {
+		if info, err := s.Info(); err == nil {
+			bump(info.ModTime())
+		}
+		if !s.IsDir() {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(dir, s.Name()))
 		if err != nil {
 			continue
 		}
-		if info.ModTime().Before(cutoff) {
-			_ = os.RemoveAll(filepath.Join(base, e.Name()))
+		for _, f := range files {
+			if info, err := f.Info(); err == nil {
+				bump(info.ModTime())
+			}
 		}
 	}
+	return newest
 }
 
 // Spawn launches a process detached from the per-turn context. Its output streams
@@ -230,9 +358,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	shell, flags := shellCmd()
 	cmd, _, _ := WrapShellCwd(m.rootCtx, shell, flags, spec.Command, spec.WorkingDir) // WorkingDir 入可写面
 	cmd.Dir = spec.WorkingDir
-	if env := withEnv(spec.Env); env != nil {
-		cmd.Env = env
-	}
+	cmd.Env = withEnv(spec.Env)
 	cmd.Stdout = f
 	cmd.Stderr = f
 	setDetached(cmd)
@@ -295,7 +421,7 @@ func (m *Manager) watch(t *Task, f *os.File) {
 
 // watchSize terminates a task whose output file grows past the cap.
 func (m *Manager) watchSize(t *Task, stop chan struct{}) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(memSampleInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -303,23 +429,34 @@ func (m *Manager) watchSize(t *Task, stop chan struct{}) {
 			return
 		case <-ticker.C:
 			if fi, err := os.Stat(t.OutputPath); err == nil && fi.Size() > maxTaskOutputBytes {
-				m.terminate(t, TaskFailed, true)
+				m.terminate(t, TaskFailed, terminateOversize)
 				return
 			}
 		}
 	}
 }
 
-// terminate kills a still-running task, recording the given terminal status. The
-// watch goroutine observes the exit and finalizes EndTime / notifications.
-func (m *Manager) terminate(t *Task, status TaskStatus, oversize bool) {
+// terminate kills a still-running task, recording the given terminal status and
+// watchdog reason. The watch goroutine observes the exit and finalizes EndTime.
+//
+// A watchdog kill enqueues its notification HERE, atomically with the status
+// flip: the status becomes readable before the process actually dies (watch only
+// runs its notification path after Wait returns), and a backgrounded task must
+// never be observed terminal-without-notification. A manual kill stays silent —
+// its own tool result already confirms it — and a natural exit is still
+// notified from watch, where the exit code is known.
+func (m *Manager) terminate(t *Task, status TaskStatus, reason string) {
 	m.mu.Lock()
 	if t.Status != TaskRunning {
 		m.mu.Unlock()
 		return
 	}
 	t.Status = status
-	t.oversize = oversize
+	t.reason = reason
+	if reason != "" && t.backgrounded && !t.notified {
+		t.notified = true
+		m.pending = append(m.pending, m.notifFor(t))
+	}
 	proc := t.cmd.Process
 	m.mu.Unlock()
 	if proc != nil {
@@ -327,11 +464,210 @@ func (m *Manager) terminate(t *Task, status TaskStatus, oversize bool) {
 	}
 }
 
+// memGuard terminates any task whose process group grows past the memory cap —
+// the twin of watchSize: a task that leaks in a loop (an accumulator that never
+// terminates, a scanner that re-reads its own output) must die at a bound
+// instead of dragging the whole host process with it.
+//
+// It is ONE goroutine for the whole Manager, not one per task. Sampling reads
+// every process on the host, so its cost is O(host processes) per pass and has
+// nothing to do with how big the watched task is; a pass per task would
+// multiply that by the number of running tasks, and would do it precisely when
+// the host is busiest, since a fork-heavy task raises the process count itself.
+// One pass answers for every task at once.
+//
+// Each pass is two tiers. The cheap tier sums per-process RSS by process group
+// — one /proc walk, no second file read. RSS double-counts copy-on-write pages,
+// so a parent that forks workers reads several times its real footprint; that
+// is tolerable for a first filter but not for a verdict, because the workloads
+// it over-reports (multiprocessing pools, preforking servers) are ordinary, and
+// killing one would tell the model to rewrite a command that never leaked. So a
+// group over the cap is re-measured with Pss, which splits each shared page
+// across its holders, and only a group over on BOTH is killed. The accurate
+// sample is expensive enough to matter (it walks every mapping under the
+// target's mmap_lock), which is why it runs only here, on the kill path.
+//
+// Between ticks a process may overshoot by whatever it allocates in the window;
+// the bound is a guard, not a wall. Sampling is /proc-based and linux-only;
+// elsewhere memGuardSupported is false and the guard never starts. The legacy
+// sync path (runBashSync, no Manager) has no watchdog either; hosts that care
+// about the cap route their Bash through the task manager.
+func (m *Manager) memGuard() {
+	ticker := time.NewTicker(memSampleInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.rootCtx.Done():
+			return
+		case <-ticker.C:
+			m.memGuardPass()
+		}
+	}
+}
+
+// memGuardPass runs one two-tier sample over every running task. Split out from
+// memGuard so a test can drive a single pass without waiting on the ticker.
+func (m *Manager) memGuardPass() {
+	limit := memCapBytes()
+	if limit <= 0 {
+		return
+	}
+	// setDetached makes every spawned child the leader of a new process group,
+	// so the group id is the child's own pid — the same handle treeKill uses.
+	m.mu.Lock()
+	watched := make(map[int]*Task, len(m.tasks))
+	for _, t := range m.tasks {
+		if t.Status == TaskRunning && t.cmd != nil && t.cmd.Process != nil {
+			watched[t.cmd.Process.Pid] = t
+		}
+	}
+	m.mu.Unlock()
+	if len(watched) == 0 {
+		return
+	}
+
+	pgids := make([]int, 0, len(watched))
+	for pgid := range watched {
+		pgids = append(pgids, pgid)
+	}
+	for pgid, rss := range pgrpRSS(pgids) {
+		if rss <= limit {
+			continue
+		}
+		// Confirm with the shared-page-aware measure before killing. A group
+		// that is over on RSS but under on Pss is re-confirmed on every later
+		// pass; that costs one accurate sample per tick for as long as it sits
+		// in the band, which is the price of not killing it.
+		if pss, ok := pgrpPSS(pgid); ok && pss <= limit {
+			continue
+		}
+		m.terminate(watched[pgid], TaskFailed, terminateMemory)
+	}
+}
+
+// defaultMemCap is the cap applied when AGENT_CORE_TASK_MEM_CAP is unset. It is
+// derived from the memory a task could actually exhaust rather than fixed at a
+// constant: a 2 GiB literal is at once too low for an ordinary parallel build
+// on a workstation and too high to protect a 1 GiB container. The budget is the
+// cgroup limit when one is set — the number the kernel OOM-kills against —
+// otherwise total host RAM; the cap is 80% of it, leaving headroom for the
+// agent itself and for everything else on the box.
+//
+// Resolved once: the budget does not change over a process's life, and
+// memCapBytes is called on every watchdog tick and in every cap-naming message.
+var defaultMemCap = sync.OnceValue(func() int64 {
+	budget, ok := hostMemBudget()
+	if !ok {
+		return fallbackMemCap
+	}
+	limit := budget / 5 * 4 // 80%, ordered to avoid overflowing on large budgets
+	if limit < minMemCap {
+		return minMemCap
+	}
+	return limit
+})
+
+// memCapBytes returns the per-task memory cap in bytes (defaultMemCap when
+// unset). AGENT_CORE_TASK_MEM_CAP overrides it ("512m", "2g", plain bytes);
+// "0" or "off" disables the guard. An unparseable value falls back to the
+// default rather than to disabled — a typo must not open the floodgate.
+func memCapBytes() int64 {
+	raw := strings.TrimSpace(os.Getenv("AGENT_CORE_TASK_MEM_CAP"))
+	if raw == "" {
+		return defaultMemCap()
+	}
+	v, ok := parseMemCap(raw)
+	if !ok {
+		return defaultMemCap()
+	}
+	return v
+}
+
+// memUnits orders every accepted suffix longest-first so the match is
+// deterministic ("512mb" must read as 512 MiB, not "512m" + leftover "b").
+var memUnits = []struct {
+	suffix string
+	mult   int64
+}{
+	{"kib", 1 << 10}, {"mib", 1 << 20}, {"gib", 1 << 30}, {"tib", 1 << 40},
+	{"kb", 1 << 10}, {"mb", 1 << 20}, {"gb", 1 << 30}, {"tb", 1 << 40},
+	{"b", 1}, {"k", 1 << 10}, {"m", 1 << 20}, {"g", 1 << 30}, {"t", 1 << 40},
+}
+
+// parseMemCap parses a memory quantity: a non-negative integer plus an optional
+// b/k/m/g/t unit (byte, binary and SI spellings, case-insensitive). "0" and
+// "off" disable the cap.
+func parseMemCap(s string) (int64, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "0" || s == "off" {
+		return 0, true
+	}
+	mult := int64(1)
+	for _, u := range memUnits {
+		if strings.HasSuffix(s, u.suffix) {
+			s = strings.TrimSuffix(s, u.suffix)
+			mult = u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	// Reject rather than wrap: an overflowing product lands on a negative or
+	// zero cap, which memCapBytes would read as "guard disabled" — the one
+	// outcome a typo must never produce.
+	if mult > 1 && n > math.MaxInt64/mult {
+		return 0, false
+	}
+	return n * mult, true
+}
+
+// humanBytes renders a byte count in the first binary unit that fits — whole
+// when it divides, one decimal otherwise — the form caps appear in the
+// user-visible error and notification texts.
+func humanBytes(n int64) string {
+	for _, u := range []struct {
+		name string
+		size int64
+	}{
+		{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10},
+	} {
+		if n < u.size {
+			continue
+		}
+		if n%u.size == 0 {
+			return fmt.Sprintf("%d%s", n/u.size, u.name)
+		}
+		return fmt.Sprintf("%.1f%s", float64(n)/float64(u.size), u.name)
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+// terminateLabel renders a watchdog reason for the task-reading tools, naming
+// the cap that fired. It returns "" for a natural exit or a manual kill.
+//
+// These tools would otherwise print the exit code, and a watchdog kill has no
+// meaningful one: terminate flips the status before the SIGKILL lands, so watch
+// skips the exit-code path and the field keeps its zero value. "failed exit=0"
+// is worse than silence — the reason is the only thing that explains the death.
+func terminateLabel(reason string) string {
+	switch reason {
+	case terminateMemory:
+		return "killed: memory cap " + humanBytes(memCapBytes()) + " exceeded"
+	case terminateOversize:
+		return "killed: output cap " + humanBytes(maxTaskOutputBytes) + " exceeded"
+	}
+	return ""
+}
+
 func (m *Manager) notifFor(t *Task) Notification {
 	var sum string
 	switch {
-	case t.oversize:
+	case t.reason == terminateOversize:
 		sum = fmt.Sprintf("Task %q 输出超过上限已被终止 (%s)。", short(t.Command), t.Kind)
+	case t.reason == terminateMemory:
+		sum = fmt.Sprintf("Task %q 内存占用超过单条命令上限 %s，进程组已被终止。用 TaskOutput 或 Read 读取输出文件。", short(t.Command), humanBytes(memCapBytes()))
 	case t.Status == TaskCompleted:
 		sum = fmt.Sprintf("Task %q 已完成 (exit %d)。用 TaskOutput 或 Read 读取输出文件。", short(t.Command), t.ExitCode)
 	case t.Status == TaskFailed:
@@ -414,7 +750,7 @@ func (m *Manager) Kill(id string) bool {
 	if !ok {
 		return false
 	}
-	m.terminate(t, TaskKilled, false)
+	m.terminate(t, TaskKilled, "")
 	return true
 }
 
@@ -432,7 +768,7 @@ func (m *Manager) KillAll() int {
 		running := t.Status == TaskRunning
 		m.mu.Unlock()
 		if running {
-			m.terminate(t, TaskKilled, false)
+			m.terminate(t, TaskKilled, "")
 			n++
 		}
 	}
@@ -510,18 +846,34 @@ func (m *Manager) DrainNotifications() []Notification {
 	return out
 }
 
-// Cleanup kills all tasks, cancels the root context, and removes the session's
-// task directory. Safe to call on a nil Manager.
+// Cleanup kills all tasks, closes PTY sessions, removes the session's task
+// directory and cancels the root context. Safe to call on a nil Manager.
+//
+// Removing the directory does strand the "full output saved to <path>" pointers
+// that were handed to the model, which is a real cost. It is still the right
+// trade: agentcore mints a fresh random sessionID per Session, so keeping the
+// directory means every run of the host leaves one behind, each task file capped
+// only at maxTaskOutputBytes (50 MiB), with the stale sweep below as the sole
+// reclaimer — and that sweep runs only inside NewManager, so a host that stops
+// opening sessions never reclaims at all. Deterministic cleanup at a known cost
+// beats unbounded growth in the host's temp dir.
+//
+// Those pointers are consumed inside the session that produced them. Making
+// them genuinely durable needs spill output to live in a host-chosen directory
+// with its own retention policy, not in os.TempDir() keyed by a per-session
+// UUID; that is a design change, not a change to this function.
 func (m *Manager) Cleanup() {
 	if m == nil {
 		return
 	}
 	m.KillAll()
 	m.closeAllSessions()
+	if m.dir != "" {
+		_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>, not just its tasks/
+	}
 	if m.rootCancel != nil {
 		m.rootCancel()
 	}
-	_ = os.RemoveAll(filepath.Dir(m.dir)) // <base>/<sessionID>
 }
 
 // tailFile reads the last maxBytes of a file, prefixing a notice when earlier
@@ -555,7 +907,12 @@ func tailFile(path string, maxBytes int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + string(b), nil
+	// Seeking to a byte offset lands mid-rune for any multi-byte output, and
+	// this tail goes straight to the model via Manager.Output/TaskOutput — the
+	// harness-level capture net leaves it alone because it is already under the
+	// limit. cutTail drops the partial leading rune.
+	tail := string(b)[runeSafeStart(b):]
+	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + tail, nil
 }
 
 // shellCmd returns the platform shell and the argument flags that precede the
@@ -575,7 +932,9 @@ func short(s string) string {
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "\n", " ")
 	if len(s) > 60 {
-		return s[:57] + "..."
+		// This lands in notification summaries, so a CJK/emoji command must not
+		// be cut mid-rune into a replacement character.
+		return cutHead(s, 57) + "..."
 	}
 	return s
 }

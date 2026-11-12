@@ -239,6 +239,9 @@ func TestTailFileOmitsEarlier(t *testing.T) {
 	}
 }
 
+// Cleanup ends the session's processes AND removes its task directory. Every
+// Session gets a fresh random sessionID, so leaving the directory behind would
+// grow the host's temp dir without a bound that anything reliably enforces.
 func TestCleanupRemovesDir(t *testing.T) {
 	m, err := NewManager("cleanup-test")
 	if err != nil {
@@ -246,13 +249,110 @@ func TestCleanupRemovesDir(t *testing.T) {
 	}
 	task, _ := m.Spawn(SpawnSpec{Command: "sleep 5"})
 	dir := filepath.Dir(m.dir)
+	if err := os.WriteFile(filepath.Join(m.dir, "spilled.txt"), []byte("output"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	m.Cleanup()
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("session dir not removed: %v", err)
+		t.Fatalf("session dir must not survive Cleanup: err=%v", err)
 	}
 	// The spawned process is killed by Cleanup.
 	info, _ := m.Get(task.ID)
 	if info.Status == TaskRunning {
 		t.Fatalf("task still running after cleanup")
 	}
+}
+
+// The stale sweep must not delete a session that is alive and busy but older
+// than the TTL. The session dir's own mtime is stamped once by MkdirAll and
+// never refreshed, so judging by it alone would remove a long-running session's
+// directory out from under it — the dead-pointer failure the sweep is meant to
+// avoid causing.
+func TestCleanStaleSessionsKeepsActiveSessions(t *testing.T) {
+	base := t.TempDir()
+	old := time.Now().Add(-2 * staleSessionTTL)
+
+	// A session that crashed long ago: nothing inside is recent.
+	dead := filepath.Join(base, "dead", "tasks")
+	if err := os.MkdirAll(dead, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	deadFile := filepath.Join(dead, "out.log")
+	if err := os.WriteFile(deadFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A session whose dir is equally old but whose task output is still being
+	// appended to right now.
+	busy := filepath.Join(base, "busy", "tasks")
+	if err := os.MkdirAll(busy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	busyFile := filepath.Join(busy, "out.log")
+	if err := os.WriteFile(busyFile, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{deadFile, dead, filepath.Dir(dead), busy, filepath.Dir(busy)} {
+		if err := os.Chtimes(p, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cleanStaleSessions(base, "current")
+
+	if _, err := os.Stat(filepath.Dir(dead)); !os.IsNotExist(err) {
+		t.Errorf("stale session dir survived the sweep: err=%v", err)
+	}
+	if _, err := os.Stat(busyFile); err != nil {
+		t.Errorf("active session was swept away despite recent task output: %v", err)
+	}
+}
+
+// withEnv puts the non-interactive defaults in front of nothing and behind the
+// host: a spawned shell never blocks on a pager, and a host that names a value
+// explicitly still wins — without duplicate keys, since getenv returns the first
+// match and an appended duplicate would silently lose.
+func TestWithEnvNonInteractiveDefaults(t *testing.T) {
+	env := withEnv(nil)
+	want := map[string]string{
+		"PAGER": "cat", "GIT_PAGER": "cat", "SYSTEMD_PAGER": "cat",
+		"DEBIAN_FRONTEND": "noninteractive",
+	}
+	for k, v := range want {
+		if got := envValue(env, k); got != v {
+			t.Fatalf("%s=%q, want %q", k, got, v)
+		}
+	}
+	host := withEnv([]string{"PAGER=less", "ARTEX_MARK=1"})
+	if got := envValue(host, "PAGER"); got != "less" {
+		t.Fatalf("host override lost: PAGER=%q", got)
+	}
+	if got := envValue(host, "ARTEX_MARK"); got != "1" {
+		t.Fatalf("host var lost: ARTEX_MARK=%q", got)
+	}
+	if got := envValue(host, "GIT_PAGER"); got != "cat" {
+		t.Fatalf("default must still apply when the host is silent: GIT_PAGER=%q", got)
+	}
+	if n := countKey(host, "PAGER"); n != 1 {
+		t.Fatalf("duplicate PAGER entries: %d (first match wins, so a duplicate is a silent bug)", n)
+	}
+}
+
+// envValue reads a key the way a child process would: the FIRST matching entry.
+func envValue(env []string, key string) string {
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			return strings.TrimPrefix(kv, key+"=")
+		}
+	}
+	return ""
+}
+
+func countKey(env []string, key string) int {
+	n := 0
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			n++
+		}
+	}
+	return n
 }
