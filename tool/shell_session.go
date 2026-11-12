@@ -312,7 +312,10 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 		cols = sessDefCols
 	}
 	shell, flags := shellCmd()
-	cmd, _, _ := WrapShellCwd(m.rootCtx, shell, flags, command, workDir) // WorkingDir 入可写面
+	cmd, _, wrapErr := WrapShellCwd(m.rootCtx, shell, flags, command, workDir) // WorkingDir 入可写面
+	if wrapErr != nil {
+		return nil, wrapErr
+	}
 	cmd.Dir = workDir
 	cmd.Env = withEnv(env)
 	ptmx, err := startPTY(cmd, rows, cols)

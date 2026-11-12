@@ -60,13 +60,22 @@ func TestMemGuardSparesSharedPages(t *testing.T) {
 	// Wait for the two measures to actually diverge: while the parent is still
 	// growing its string alone there is nothing shared yet and RSS == Pss, so
 	// polling on RSS alone would sample before the forks exist.
-	pgid := task.cmd.Process.Pid
+	// 与 memGuardPass 同一口径：量足迹（root 组 ∪ 后代组），不是量 root 自己
+	// ——沙箱可能把执行体放进另一个组，直接拿 cmd.Process.Pid 当 pgid 只会
+	// 量到包装进程，RSS 永远涨不到阈值。
+	root := task.cmd.Process.Pid
 	var rss, pss int64
 	var ok bool
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
-		rss = pgrpRSS([]int{pgid})[pgid]
-		pss, ok = pgrpPSS(pgid)
+		// 每轮重算足迹：后代是在运行中才陆续出现的，一次取快照会漏。
+		pgids := descendantPgrps([]int{root})[root]
+		rss = 0
+		byPgrp := pgrpRSS(pgids)
+		for _, pg := range pgids {
+			rss += byPgrp[pg]
+		}
+		pss, ok = pgrpPSSAll(pgids)
 		if ok && rss > 400<<20 && pss < 300<<20 {
 			break
 		}

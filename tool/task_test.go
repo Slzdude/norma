@@ -322,12 +322,12 @@ func TestWithEnvNonInteractiveDefaults(t *testing.T) {
 			t.Fatalf("%s=%q, want %q", k, got, v)
 		}
 	}
-	host := withEnv([]string{"PAGER=less", "ARTEX_MARK=1"})
+	host := withEnv([]string{"PAGER=less", "HOST_MARK=1"})
 	if got := envValue(host, "PAGER"); got != "less" {
 		t.Fatalf("host override lost: PAGER=%q", got)
 	}
-	if got := envValue(host, "ARTEX_MARK"); got != "1" {
-		t.Fatalf("host var lost: ARTEX_MARK=%q", got)
+	if got := envValue(host, "HOST_MARK"); got != "1" {
+		t.Fatalf("host var lost: HOST_MARK=%q", got)
 	}
 	if got := envValue(host, "GIT_PAGER"); got != "cat" {
 		t.Fatalf("default must still apply when the host is silent: GIT_PAGER=%q", got)

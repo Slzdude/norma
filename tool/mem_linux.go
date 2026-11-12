@@ -17,9 +17,69 @@ const memGuardSupported = true
 // Indices into the fields of /proc/<pid>/stat that FOLLOW the comm field, as
 // returned by statFields: index 0 is stat field 3. See proc(5).
 const (
+	statPpid = 1  // field 4: parent pid
 	statPgrp = 2  // field 5: process group id
 	statRSS  = 21 // field 24: resident set size, in pages
 )
+
+// descendantPgrps 把每个任务 root pid 映射到它的**足迹进程组集合**：
+// root 自身所在组 ∪ 其全部后代各自所在的组。
+//
+// 为什么需要这一层：沙箱可能把真正的执行体放进与 root 不同的进程组
+// （bubblewrap 的 --new-session 会 setsid()，内部进程另起会话与组）。
+// 此时只按 root 的组量，量到的是包装进程自己（约 1MB），真正膨胀的
+// 负载在另一个组里看不见——护栏因此失效。
+//
+// 发现走 ppid 链，**统计仍按进程组**（见 pgrpRSS 的说明）：孤儿化进程
+// 脱离了树却仍留在原组里，仍会被计入——这与 treeKill 杀的范围保持一致。
+// 换句话说，ppid walk 只用来「找到有哪些组」，不用来做计量单位。
+//
+// 一次 /proc 遍历建 ppid 图，再按 root 各做一次 BFS；root 已退出时返回
+// 空集，读作零——「进程已结束的任务永远不会超限」，走正常结束路径。
+func descendantPgrps(rootPids []int) map[int][]int {
+	type node struct{ ppid, pgrp int }
+	byPid := map[int]node{}
+	children := map[int][]int{}
+	forEachPid(func(pid int) {
+		f, ok := statFields(pid)
+		if !ok || len(f) <= statRSS {
+			return
+		}
+		ppid, err := strconv.Atoi(f[statPpid])
+		if err != nil {
+			return
+		}
+		pgrp, err := strconv.Atoi(f[statPgrp])
+		if err != nil {
+			return
+		}
+		byPid[pid] = node{ppid, pgrp}
+		children[ppid] = append(children[ppid], pid)
+	})
+	out := make(map[int][]int, len(rootPids))
+	for _, root := range rootPids {
+		seenPgrp := map[int]bool{}
+		var order []int
+		seenPid := map[int]bool{root: true}
+		queue := []int{root}
+		for len(queue) > 0 {
+			pid := queue[0]
+			queue = queue[1:]
+			if n, ok := byPid[pid]; ok && !seenPgrp[n.pgrp] {
+				seenPgrp[n.pgrp] = true
+				order = append(order, n.pgrp)
+			}
+			for _, c := range children[pid] {
+				if !seenPid[c] {
+					seenPid[c] = true
+					queue = append(queue, c)
+				}
+			}
+		}
+		out[root] = order
+	}
+	return out
+}
 
 // pgrpRSS sums, per requested process group, the resident memory of every
 // process in that group. One pass over /proc answers for every running task at

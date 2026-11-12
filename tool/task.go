@@ -356,7 +356,12 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 		kind = KindBash
 	}
 	shell, flags := shellCmd()
-	cmd, _, _ := WrapShellCwd(m.rootCtx, shell, flags, spec.Command, spec.WorkingDir) // WorkingDir 入可写面
+	cmd, _, wrapErr := WrapShellCwd(m.rootCtx, shell, flags, spec.Command, spec.WorkingDir) // WorkingDir 入可写面
+	if wrapErr != nil {
+		_ = f.Close()
+		_ = os.Remove(outPath)
+		return nil, wrapErr
+	}
 	cmd.Dir = spec.WorkingDir
 	cmd.Env = withEnv(spec.Env)
 	cmd.Stdout = f
@@ -526,11 +531,37 @@ func (m *Manager) memGuardPass() {
 		return
 	}
 
-	pgids := make([]int, 0, len(watched))
-	for pgid := range watched {
-		pgids = append(pgids, pgid)
+	roots := make([]int, 0, len(watched))
+	for root := range watched {
+		roots = append(roots, root)
 	}
-	for pgid, rss := range pgrpRSS(pgids) {
+	// 一个任务的足迹是「root 自身组 ∪ 全部后代所在的组」：沙箱可能把真正的
+	// 执行体放进与 root 不同的组（bubblewrap --new-session 会 setsid()），
+	// 只量 root 的组等于量包装进程自己。发现走 ppid 链，计量单位仍是进程组
+	// ——与 treeKill 杀的范围一致，孤儿化进程也照常被计入。
+	footprint := descendantPgrps(roots)
+
+	// 粗筛仍一次 /proc 遍历答所有组，再按 root 汇总。
+	uniq := make([]int, 0, len(watched))
+	seen := map[int]bool{}
+	for _, pgs := range footprint {
+		for _, pg := range pgs {
+			if !seen[pg] {
+				seen[pg] = true
+				uniq = append(uniq, pg)
+			}
+		}
+	}
+	rssByPgrp := pgrpRSS(uniq)
+
+	for root, pgs := range footprint {
+		if len(pgs) == 0 {
+			continue // root 已退出：读作零，走正常结束路径
+		}
+		var rss int64
+		for _, pg := range pgs {
+			rss += rssByPgrp[pg]
+		}
 		if rss <= limit {
 			continue
 		}
@@ -538,11 +569,26 @@ func (m *Manager) memGuardPass() {
 		// that is over on RSS but under on Pss is re-confirmed on every later
 		// pass; that costs one accurate sample per tick for as long as it sits
 		// in the band, which is the price of not killing it.
-		if pss, ok := pgrpPSS(pgid); ok && pss <= limit {
+		if pss, ok := pgrpPSSAll(pgs); ok && pss <= limit {
 			continue
 		}
-		m.terminate(watched[pgid], TaskFailed, terminateMemory)
+		m.terminate(watched[root], TaskFailed, terminateMemory)
 	}
+}
+
+// pgrpPSSAll 对足迹内的多个进程组求 Pss 之和。ok=false 表示一个成员都测不到
+// ——足迹已空，无可确认；此时仍按超限处理，终止一个进程已空的任务无副作用。
+// 只在击杀路径调用（贵，见 pgrpPSS 的成本说明）。
+func pgrpPSSAll(pgs []int) (int64, bool) {
+	var total int64
+	seen := false
+	for _, pg := range pgs {
+		if v, ok := pgrpPSS(pg); ok {
+			total += v
+			seen = true
+		}
+	}
+	return total, seen
 }
 
 // defaultMemCap is the cap applied when AGENT_CORE_TASK_MEM_CAP is unset. It is
@@ -910,7 +956,7 @@ func tailFile(path string, maxBytes int) (string, error) {
 	// Seeking to a byte offset lands mid-rune for any multi-byte output, and
 	// this tail goes straight to the model via Manager.Output/TaskOutput — the
 	// harness-level capture net leaves it alone because it is already under the
-	// limit. cutTail drops the partial leading rune.
+	// limit. runeSafeStart drops the partial leading rune.
 	tail := string(b)[runeSafeStart(b):]
 	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + tail, nil
 }

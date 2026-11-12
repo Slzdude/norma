@@ -63,7 +63,10 @@ func TestMemGuardKillsDescendants(t *testing.T) {
 	dir := t.TempDir()
 	m := newTestManager(t)
 	cmd := fmt.Sprintf("(sleep 300 & echo $! > %s); %s", filepath.Join(dir, "child.pid"), growAndHold)
-	task, err := m.Spawn(SpawnSpec{Command: cmd})
+	// WorkingDir=dir：沙箱只把执行目录并入可写面（/tmp 在 workspace 档下是
+	// 每次 exec 的独立 tmpfs），pid 文件必须落在宿主可见的 bind 挂载上，
+	// 否则子进程写的是沙箱内的临时 tmpfs，宿主读不到。
+	task, err := m.Spawn(SpawnSpec{Command: cmd, WorkingDir: dir})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
 	}

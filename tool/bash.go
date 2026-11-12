@@ -177,7 +177,10 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	defer cancel()
 
 	shell, flags := shellCmd()
-	cmd, _, _ := WrapShellCwd(cctx, shell, flags, command, tc.WorkingDir) // bwrap 能力层（WorkingDir 入可写面）
+	cmd, _, wrapErr := WrapShellCwd(cctx, shell, flags, command, tc.WorkingDir) // bwrap 能力层（WorkingDir 入可写面）
+	if wrapErr != nil {
+		return Errorf("Error: " + wrapErr.Error()), nil
+	}
 	if tc != nil {
 		cmd.Dir = tc.WorkingDir
 		cmd.Env = withEnv(tc.Env)

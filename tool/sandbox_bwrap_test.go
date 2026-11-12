@@ -206,7 +206,10 @@ func TestSandboxTaskRootSiblingMkdir(t *testing.T) {
 		t.Errorf("任务根兄弟目录应可写: %v out=%s", err, out)
 	}
 	// 任务根外仍拒（语义不变核对③）。
-	cmd2, _, _ := WrapShellCwd(ctx, "bash", []string{"-c"}, "echo x > /etc/task145-probe 2>&1", work)
+	cmd2, _, werr := WrapShellCwd(ctx, "bash", []string{"-c"}, "echo x > /etc/task145-probe 2>&1", work)
+	if werr != nil {
+		t.Fatalf("WrapShellCwd: %v", werr)
+	}
 	cmd2.Dir = work
 	out2, _ := cmd2.CombinedOutput()
 	if stringContains(string(out2), "\nx") {
