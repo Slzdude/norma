@@ -12,6 +12,11 @@ import (
 type Accumulator struct {
 	blocks     []ContentBlock
 	toolInputs []*strings.Builder
+	toolSigs   []string // ThoughtSignature for the tool_use block at the same index as toolInputs
+	// toolPos maps a provider-assigned StreamEvent.ToolIndex to its position in
+	// toolSigs, so a signature frame naming index 0 lands on call 0 even after
+	// call 1 has started.
+	toolPos    map[int]int
 	textBuf    *strings.Builder
 	thinkBuf   *strings.Builder
 	thinkSig   string // signature for the current thinking block
@@ -46,15 +51,29 @@ func (a *Accumulator) Add(ev StreamEvent) {
 		a.flushThinking()
 		a.blocks = append(a.blocks, ContentBlock{Type: BlockToolUse, ID: ev.ToolID, Name: ev.ToolName})
 		a.toolInputs = append(a.toolInputs, &strings.Builder{})
+		a.toolSigs = append(a.toolSigs, "")
+		if a.toolPos == nil {
+			a.toolPos = map[int]int{}
+		}
+		a.toolPos[ev.ToolIndex] = len(a.toolSigs) - 1
 	case SEToolInputJSON:
 		if n := len(a.toolInputs); n > 0 {
 			a.toolInputs[n-1].WriteString(ev.Text)
+		}
+	case SEToolUseSignature:
+		// Prefer the provider's index; adapters that do not set one (Anthropic,
+		// the Responses API) leave it 0, which for them means "the call in
+		// flight" — the fallback covers that and an index we never saw start.
+		if pos, ok := a.toolPos[ev.ToolIndex]; ok {
+			a.toolSigs[pos] = ev.Text
+		} else if n := len(a.toolSigs); n > 0 {
+			a.toolSigs[n-1] = ev.Text
 		}
 	case SEMessageDelta:
 		if ev.StopReason != "" {
 			a.StopReason = ev.StopReason
 		}
-		a.Usage.Add(ev.Usage)
+		a.Usage.MergeEcho(ev.Usage)
 	case SEMessageStop:
 		a.flushText()
 		a.flushThinking()
@@ -94,11 +113,12 @@ func (a *Accumulator) Message() Message {
 	for i, b := range a.blocks {
 		if b.Type == BlockToolUse {
 			raw := strings.TrimSpace(a.toolInputs[ti].String())
-			ti++
 			if raw == "" || !json.Valid([]byte(raw)) {
 				raw = "{}"
 			}
 			b.Input = json.RawMessage(raw)
+			b.ThoughtSignature = a.toolSigs[ti]
+			ti++
 		}
 		out[i] = b
 	}

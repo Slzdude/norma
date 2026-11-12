@@ -9,9 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/Slzdude/norma/llm"
+	"github.com/Slzdude/norma/permission"
+	"github.com/Slzdude/norma/tool"
 )
 
 // QueryInput is a fully-resolved request to run the loop.
@@ -67,7 +67,9 @@ type QueryInput struct {
 	TodoReminderTurnsBetweenReminder int
 
 	// BashEnv holds extra "KEY=VALUE" entries injected into Bash subprocess
-	// environments (foreground + background). Empty = inherit unchanged.
+	// environments (foreground + background). Empty still applies the
+	// non-interactive defaults (PAGER/GIT_PAGER/SYSTEMD_PAGER/DEBIAN_FRONTEND);
+	// see tool.ToolContext.Env.
 	BashEnv []string
 
 	// Permission policy.
@@ -822,8 +824,16 @@ func (l *loop) streamAndExecute(schemas []llm.ToolSchema) (asst llm.Message, exe
 			err = e
 			break
 		}
-		if ev.Type == llm.SEToolInputJSON {
-			if building {
+		// Events that belong INSIDE a tool_use block must not reach
+		// finalizeTool below — that dispatches the tool and clears `building`,
+		// so any argument delta still to come would be dropped on the floor
+		// (curInput.WriteString is gated on `building`) and the tool would run
+		// with raw == "{}" while acc.Message() records the real arguments.
+		// SEToolUseSignature trails the arguments in Gemini's current framing,
+		// but a gateway is free to attach extra_content to the chunk that only
+		// declares id/name — so route it to the accumulator, not the boundary.
+		if ev.Type == llm.SEToolInputJSON || ev.Type == llm.SEToolUseSignature {
+			if building && ev.Type == llm.SEToolInputJSON {
 				curInput.WriteString(ev.Text)
 			}
 			acc.Add(ev)

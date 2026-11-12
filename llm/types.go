@@ -46,6 +46,34 @@ type ContentBlock struct {
 	Name  string          `json:"name,omitempty"`
 	Input json.RawMessage `json:"input,omitempty"`
 
+	// ThoughtSignature is Gemini's opaque per-tool-call token, present on a
+	// tool_use block only when the model was reached through Gemini's
+	// OpenAI-compatible endpoint (generativelanguage.googleapis.com/.../openai).
+	// A Gemini thinking model requires this value to be echoed back verbatim on
+	// the same tool call when the turn is replayed in multi-turn history;
+	// otherwise the API rejects the request with "Function call is missing a
+	// thought_signature in functionCall parts."
+	// See https://ai.google.dev/gemini-api/docs/thinking#signatures.
+	//
+	// It is provider-scoped state that outlives the provider that issued it:
+	// transcripts persist llm.Message verbatim, so a session recorded against
+	// Gemini can be resumed, summarized or sub-agented with a DIFFERENT provider
+	// configured. Two consequences, handled in opposite ways:
+	//
+	//   - Anthropic: ContentBlock is marshaled straight into anthropicReq, so a
+	//     populated field would become an unknown key inside a tool_use block
+	//     and draw "Extra inputs are not permitted". filterThinkingBlocks
+	//     clears it on the way out; this field must never reach that wire.
+	//   - Other OpenAI-compatible gateways: toOpenAIMessages replays it
+	//     unconditionally, because the alternative — sniffing the base URL for
+	//     Google's host — silently drops the signature for anyone reaching
+	//     Gemini through a proxy or Vertex-style path, re-breaking the exact
+	//     rejection this field exists to prevent. Over-sending costs a 400 only
+	//     on a gateway that both forbids unknown fields AND is being fed a
+	//     history recorded elsewhere; that fails loudly and is recoverable,
+	//     whereas a dropped signature fails on every Gemini turn.
+	ThoughtSignature string `json:"thought_signature,omitempty"`
+
 	// ToolResult: the outcome of a tool, fed back to the model.
 	ToolUseID string         `json:"tool_use_id,omitempty"`
 	Content   []ContentBlock `json:"content,omitempty"`
@@ -112,6 +140,25 @@ func (u *Usage) Add(o Usage) {
 	u.OutputTokens += o.OutputTokens
 	u.CacheReadTokens += o.CacheReadTokens
 	u.CacheWriteTokens += o.CacheWriteTokens
+}
+
+// MergeEcho folds a usage report that may re-echo fields already counted by an
+// earlier event (Anthropic repeats the input side in message_start and
+// message_delta): echoed input/cache fields take the max instead of summing,
+// while output keeps accumulating. Emulations that report zeros in
+// message_start and real counts only in message_delta are thereby recovered
+// instead of lost.
+func (u *Usage) MergeEcho(o Usage) {
+	u.OutputTokens += o.OutputTokens
+	if o.InputTokens > u.InputTokens {
+		u.InputTokens = o.InputTokens
+	}
+	if o.CacheReadTokens > u.CacheReadTokens {
+		u.CacheReadTokens = o.CacheReadTokens
+	}
+	if o.CacheWriteTokens > u.CacheWriteTokens {
+		u.CacheWriteTokens = o.CacheWriteTokens
+	}
 }
 
 // ToolSchema is a tool definition exposed to the model.

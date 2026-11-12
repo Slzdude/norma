@@ -28,6 +28,26 @@ type oaToolCall struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
+	// ExtraContent carries vendor extensions Gemini attaches to a tool_calls
+	// entry when reached through its OpenAI-compatible endpoint. Every other
+	// OpenAI-compatible gateway simply omits this field on the way in and never
+	// reads it on the way out, so round-tripping it is a no-op for them. See
+	// ContentBlock.ThoughtSignature.
+	ExtraContent *oaExtraContent `json:"extra_content,omitempty"`
+}
+
+// oaExtraContent is Gemini's vendor-extension wrapper on a tool_calls entry.
+type oaExtraContent struct {
+	Google *oaGoogleExtra `json:"google,omitempty"`
+}
+
+type oaGoogleExtra struct {
+	// ThoughtSignature must be echoed back verbatim on the same tool call when
+	// the turn is replayed in multi-turn history, or a Gemini thinking model
+	// rejects the request with "Function call is missing a thought_signature
+	// in functionCall parts." See
+	// https://ai.google.dev/gemini-api/docs/thinking#signatures.
+	ThoughtSignature string `json:"thought_signature,omitempty"`
 }
 
 type oaTool struct {
@@ -50,14 +70,14 @@ type oaReq struct {
 	// MaxTokens and MaxCompletionTokens are mutually exclusive: buildBody fills
 	// exactly one of them per Config.MaxTokensField, and omitempty drops the
 	// other. Sending both would make OpenAI reject the request.
-	MaxTokens           int      `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int      `json:"max_completion_tokens,omitempty"`
-	Temperature         *float64 `json:"temperature,omitempty"`
-	Stop            []string      `json:"stop,omitempty"`
-	Thinking        *oaThinking   `json:"thinking,omitempty"`
-	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
-	Stream          bool          `json:"stream"`
-	StreamOptions   *oaStreamOpts `json:"stream_options,omitempty"`
+	MaxTokens           int           `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int           `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64      `json:"temperature,omitempty"`
+	Stop                []string      `json:"stop,omitempty"`
+	Thinking            *oaThinking   `json:"thinking,omitempty"`
+	ReasoningEffort     string        `json:"reasoning_effort,omitempty"`
+	Stream              bool          `json:"stream"`
+	StreamOptions       *oaStreamOpts `json:"stream_options,omitempty"`
 }
 
 type oaStreamOpts struct {
@@ -94,6 +114,14 @@ func toOpenAIMessages(system string, msgs []Message) []oaMessage {
 					tc.Function.Arguments = string(b.Input)
 					if tc.Function.Arguments == "" {
 						tc.Function.Arguments = "{}"
+					}
+					// Replay Gemini's thought_signature verbatim, or a thinking
+					// model 400s on this tool call when the turn is replayed.
+					// Unconditional on purpose, including against non-Google
+					// gateways — see ContentBlock.ThoughtSignature for why
+					// sniffing the base URL would be the worse failure.
+					if b.ThoughtSignature != "" {
+						tc.ExtraContent = &oaExtraContent{Google: &oaGoogleExtra{ThoughtSignature: b.ThoughtSignature}}
 					}
 					om.ToolCalls = append(om.ToolCalls, tc)
 				}
@@ -477,9 +505,25 @@ func parseOpenAIResponse(raw []byte) (Message, string, Usage, error) {
 		if strings.TrimSpace(in) == "" {
 			in = "{}"
 		}
-		blocks = append(blocks, ContentBlock{Type: BlockToolUse, ID: tc.ID, Name: tc.Function.Name, Input: []byte(in)})
+		blocks = append(blocks, ContentBlock{
+			Type:             BlockToolUse,
+			ID:               tc.ID,
+			Name:             tc.Function.Name,
+			Input:            []byte(in),
+			ThoughtSignature: thoughtSignature(tc),
+		})
 	}
 	return Message{Role: RoleAssistant, Content: blocks}, mapOpenAIFinish(ch.FinishReason), usage, nil
+}
+
+// thoughtSignature extracts Gemini's thought_signature from a tool_calls
+// entry, if its OpenAI-compatible endpoint attached one. Every other gateway
+// leaves ExtraContent nil.
+func thoughtSignature(tc oaToolCall) string {
+	if tc.ExtraContent == nil || tc.ExtraContent.Google == nil {
+		return ""
+	}
+	return tc.ExtraContent.Google.ThoughtSignature
 }
 
 func truncate(s string, max int) string {
@@ -552,10 +596,20 @@ func parseOpenAIFrame(data string, started map[int]bool) (evs []StreamEvent, sto
 	for _, tc := range ch.Delta.ToolCalls {
 		if !started[tc.Index] && (tc.ID != "" || tc.Function.Name != "") {
 			started[tc.Index] = true
-			evs = append(evs, StreamEvent{Type: SEToolUseStart, ToolID: tc.ID, ToolName: tc.Function.Name})
+			evs = append(evs, StreamEvent{Type: SEToolUseStart, ToolID: tc.ID, ToolName: tc.Function.Name, ToolIndex: tc.Index})
 		}
 		if tc.Function.Arguments != "" {
 			evs = append(evs, StreamEvent{Type: SEToolInputJSON, Text: tc.Function.Arguments})
+		}
+		// Gemini attaches thought_signature to the delta that completes this
+		// tool call, after its arguments — mirrors how SEThinkingSignature
+		// trails a thinking block's deltas. Carry tc.Index: with parallel calls
+		// a frame for index 0 can arrive after call 1 has started, and routing
+		// the signature to "whichever started last" would put it on the wrong
+		// call — producing exactly the missing-thought_signature rejection this
+		// plumbing exists to prevent.
+		if sig := thoughtSignature(tc); sig != "" {
+			evs = append(evs, StreamEvent{Type: SEToolUseSignature, Text: sig, ToolIndex: tc.Index})
 		}
 	}
 	if ch.FinishReason != "" {
