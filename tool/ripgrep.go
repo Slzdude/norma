@@ -62,7 +62,7 @@ func installRipgrepViaNpm() string {
 		return "" // no npm → Go fallback
 	}
 	cmd := exec.Command("npm", "install", "-g", "@vscode/ripgrep")
-	if err := cmd.Run(); err != nil {
+	if _, err := RunLimited(cmd); err != nil {
 		return ""
 	}
 	if p, err := exec.LookPath("rg"); err == nil {
@@ -74,7 +74,7 @@ func installRipgrepViaNpm() string {
 // npmGlobalRipgrep locates the rg binary vendored by @vscode/ripgrep in the npm
 // global root (it exposes no `rg` command, so we resolve the path directly).
 func npmGlobalRipgrep() string {
-	out, err := exec.Command("npm", "root", "-g").Output()
+	out, err := RunLimited(exec.Command("npm", "root", "-g"))
 	if err != nil {
 		return ""
 	}
@@ -147,7 +147,7 @@ func runWithRipgrep(rg string, r ripgrepReq, tc *ToolContext) (Result, bool) {
 
 	cmd := exec.Command(rg, args...)
 	cmd.Dir = dir
-	out, err := cmd.Output()
+	out, err := RunLimited(cmd)
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) && ee.ExitCode() == 1 {
