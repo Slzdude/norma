@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Autumn-27/norma/llm"
-	"github.com/Autumn-27/norma/permission"
-	"github.com/Autumn-27/norma/tool"
+	"github.com/Slzdude/norma/llm"
+	"github.com/Slzdude/norma/permission"
+	"github.com/Slzdude/norma/tool"
 )
 
 // drainWithCtx is drain() over a caller-supplied ctx, so a test can cancel the
@@ -38,7 +38,7 @@ func drainWithCtx(t *testing.T, ctx context.Context, in QueryInput, deps QueryDe
 func TestSettlementOnToolOverrunsBudget(t *testing.T) {
 	m := &scriptedModel{turns: [][]llm.StreamEvent{
 		toolTurn("s1", "sleep", `{"seconds":3600}`), // hangs far past MaxDuration
-		textTurn("已写回事实并总结"),                          // settlement turn → natural stop
+		textTurn("已写回事实并总结"),                        // settlement turn → natural stop
 	}}
 	in := QueryInput{
 		Messages:       []llm.Message{llm.UserText("go")},

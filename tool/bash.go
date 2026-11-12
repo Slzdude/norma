@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Autumn-27/norma/permission"
+	"github.com/Slzdude/norma/permission"
 )
 
 // catastrophicBash matches a small set of irreversibly destructive commands
@@ -157,12 +157,12 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	defer cancel()
 
 	shell, flags := shellCmd()
-	cmd := exec.CommandContext(cctx, shell, append(flags, command)...)
+	cmd, _, _ := WrapShellCwd(cctx, shell, flags, command, tc.WorkingDir) // bwrap 能力层（WorkingDir 入可写面）
 	if tc != nil {
 		cmd.Dir = tc.WorkingDir
-		if env := withEnv(tc.Env); env != nil {
-			cmd.Env = env
-		}
+		cmd.Env = withEnv(tc.Env)
+	} else {
+		cmd.Env = withEnv(nil)
 	}
 	var buf bytes.Buffer
 	cmd.Stdout = &buf

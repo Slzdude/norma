@@ -65,7 +65,7 @@ type ptySession struct {
 	lastOut  time.Time
 	exitedAt time.Time
 
-	readCur  int64 // tool-side read cursor (shell_read without since_cursor continues here)
+	readCur  int64         // tool-side read cursor (shell_read without since_cursor continues here)
 	notifyCh chan struct{} // pinged on new output
 	done     chan struct{} // closed when the process exits
 }
@@ -124,9 +124,22 @@ func (s *ptySession) readSince(c int64, maxLines, maxBytes int, drain bool) (out
 		from, omitted = start, true
 	}
 	seg := s.buf[from-start:]
+	// The ring buffer's base is a raw byte offset, so dropping old output can
+	// leave a partial leading rune. Advance `from` by what we skip: the cursor
+	// must stay equal to the first byte NOT returned, or the next read repeats
+	// or loses output.
+	if omitted {
+		if n := runeSafeStart(seg); n > 0 {
+			from += int64(n)
+			seg = seg[n:]
+		}
+	}
 	if !drain {
 		if maxBytes > 0 && len(seg) > maxBytes {
-			seg = seg[:maxBytes]
+			// Cut on a rune boundary. The bytes held back are not lost: the
+			// returned cursor advances by exactly len(seg), so the next call
+			// resumes at the boundary.
+			seg = seg[:runeSafeLen(seg, maxBytes)]
 		}
 		if maxLines > 0 {
 			if idx := nthByte(seg, '\n', maxLines); idx >= 0 {
@@ -299,11 +312,9 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 		cols = sessDefCols
 	}
 	shell, flags := shellCmd()
-	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, command)...)
+	cmd, _, _ := WrapShellCwd(m.rootCtx, shell, flags, command, workDir) // WorkingDir 入可写面
 	cmd.Dir = workDir
-	if e := withEnv(env); e != nil {
-		cmd.Env = e
-	}
+	cmd.Env = withEnv(env)
 	ptmx, err := startPTY(cmd, rows, cols)
 	if err != nil {
 		return nil, err
