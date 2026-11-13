@@ -48,8 +48,18 @@ func TestMemGuardCatchesOrphanedDescendant(t *testing.T) {
 // command that never leaked, so a group over the cheap bound must be confirmed
 // against Pss before it dies.
 func TestMemGuardSparesSharedPages(t *testing.T) {
-	// Between the two measures: sum(RSS) ~880 MiB is over, Pss ~145 MiB is not.
-	t.Setenv("AGENT_CORE_TASK_MEM_CAP", "400m")
+	// 目标形状：sum(RSS) 越上限、sum(Pss) 不越——COW 页被每个持有者各计一遍，
+	// 按 sum(RSS) 杀会误杀普通的 multiprocessing 负载。
+	//
+	// 上限取 600m 是量出来的，不是拍的。工作负载先倍增拼接到 1.3 亿字符再 fork：
+	//   · 独占阶段（无共享）峰值 RSS≈Pss≈425MiB —— 倍增拼接时旧串与新串同时在堆上，
+	//     峰值约为稳定值(131MiB)的 3.3 倍。**此阶段 RSS 与 Pss 不可分，两层判定
+	//     分不出来，双双越线就会被正确击杀**，所以工作负载的独占峰值必须低于上限。
+	//   · fork 5 个子 shell 后：sumRSS≈786MiB（6×131）越上限，sumPss≈129MiB 不越。
+	// 故上限须落在 (425, 786) 之间；600m 两侧各留 ~30% 余量。
+	//
+	// 注：阈值从 memCapBytes() 派生而非硬编码字面量——否则改上限时会静默失效。
+	t.Setenv("AGENT_CORE_TASK_MEM_CAP", "600m")
 	m := newTestManager(t)
 	task, err := m.Spawn(SpawnSpec{Command: forkShared})
 	if err != nil {
@@ -63,6 +73,8 @@ func TestMemGuardSparesSharedPages(t *testing.T) {
 	// 与 memGuardPass 同一口径：量足迹（root 组 ∪ 后代组），不是量 root 自己
 	// ——沙箱可能把执行体放进另一个组，直接拿 cmd.Process.Pid 当 pgid 只会
 	// 量到包装进程，RSS 永远涨不到阈值。
+	cap := memCapBytes()
+	under := cap / 4 * 3 // Pss 须留足余量，别贴着上限判「不越」
 	root := task.cmd.Process.Pid
 	var rss, pss int64
 	var ok bool
@@ -76,17 +88,20 @@ func TestMemGuardSparesSharedPages(t *testing.T) {
 			rss += byPgrp[pg]
 		}
 		pss, ok = pgrpPSSAll(pgids)
-		if ok && rss > 400<<20 && pss < 300<<20 {
+		if ok && rss > cap && pss < under {
 			break
 		}
-		if info, ok := m.Get(task.ID); ok && info.Status.Terminal() {
-			t.Fatalf("task died at %s/%s before the shared allocation was resident (rss=%dMiB pss=%dMiB)",
-				info.Status, info.Reason, rss>>20, pss>>20)
+		if info, done := m.Get(task.ID); done && info.Status.Terminal() {
+			// 上限已选在独占峰值之上（见函数头），所以共享建立前就被杀
+			// 不再是「独占阶段越线」的正常情况——这里报失败是对的。
+			t.Fatalf("task died at %s/%s before the shared allocation was resident (rss=%dMiB pss=%dMiB cap=%dMiB)",
+				info.Status, info.Reason, rss>>20, pss>>20, cap>>20)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if !ok || rss <= 400<<20 || pss >= 400<<20 {
-		t.Skipf("workload did not land between the two measures on this host (rss=%dMiB pss=%dMiB ok=%v)", rss>>20, pss>>20, ok)
+	if !ok || rss <= cap || pss >= under {
+		t.Skipf("workload did not land between the two measures on this host (rss=%dMiB pss=%dMiB cap=%dMiB ok=%v)",
+			rss>>20, pss>>20, cap>>20, ok)
 	}
 
 	// Several guard passes with the group sitting over the cheap bound.
