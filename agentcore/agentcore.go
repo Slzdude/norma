@@ -198,6 +198,13 @@ type Options struct {
 	// env var disables them for every session; this field is the per-session equivalent.
 	DisableBackgroundTasks bool
 
+	// Remote, when non-nil, routes this session's remote-eligible tool calls
+	// to a distributed executor instead of local subprocesses (分布式执行器
+	// 架构). Set by the host once per session (one claimed executor for the
+	// whole session — see tool.RemoteRunner's doc comment for why). nil =
+	// always local, unchanged default.
+	Remote tool.RemoteRunner
+
 	// NonStreaming runs every model call as a single non-streaming request
 	// (Provider.Complete) instead of a token stream. The host still receives the
 	// same event sequence (text/thinking/tool_use/usage), just delivered when the
@@ -509,6 +516,7 @@ func (s *Session) Prompt(ctx context.Context, input string) iter.Seq2[harness.Ev
 		ToolOutputDir:      s.opts.ToolOutputDir,
 		MaxToolOutputChars: s.opts.MaxToolOutputChars,
 		Tasks:              s.tasks,
+		Remote:             s.opts.Remote,
 		BashEnv:            s.opts.BashEnv,
 		PermissionMode:     s.opts.PermissionMode,
 		Allowed:            s.opts.AllowedTools,

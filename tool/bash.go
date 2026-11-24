@@ -98,12 +98,74 @@ func runBash(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 		}
 	}
 
+	// Distributed execution: this session has a claimed executor (分布式执行器
+	// 架构). Checked before the local task-manager path — a session is either
+	// entirely remote or entirely local, never mixed, so background-process/PTY
+	// state started by one call stays visible to later calls in the same
+	// session. run_in_background isn't supported remotely yet (v1 scope), so it
+	// fails loud here rather than silently falling back to local (which would
+	// split this session's state across two hosts) or silently dropping the
+	// background request (which would surprise the model with a blocking call
+	// it asked to be non-blocking).
+	if tc != nil && tc.Remote != nil {
+		if in.RunInBackground {
+			return Errorf("Error: run_in_background is not yet supported when this session is running on a distributed executor"), nil
+		}
+		return runBashRemote(ctx, tc, in.Command, timeout)
+	}
+
 	// Background-capable path: requires a task manager on the context.
 	if tc != nil && tc.Tasks != nil && !BackgroundTasksDisabled() {
 		return runBashManaged(ctx, tc, in.Command, timeout, in.RunInBackground)
 	}
 	// Fallback: synchronous execution (unchanged legacy behavior).
 	return runBashSync(ctx, tc, in.Command, timeout)
+}
+
+// runBashRemote dispatches command to the executor claimed for this session
+// and translates the result back into the same Result shape runBashSync/
+// runBashManaged produce, so the model sees no difference in output format
+// between local and remote execution.
+func runBashRemote(ctx context.Context, tc *ToolContext, command string, timeout time.Duration) (Result, error) {
+	res, err := tc.Remote.Run(ctx, RemoteRunRequest{
+		Command: command,
+		Env:     tc.Env,
+		Timeout: timeout,
+	})
+	if err != nil {
+		return Errorf("Error: " + err.Error()), nil
+	}
+	return FormatRemoteResult(tc, res, timeout)
+}
+
+// FormatRemoteResult translates a RemoteRunResult into the same Result shape
+// local execution produces (exit-code/timeout/empty-output messaging), so the
+// model sees no difference between local and remote execution regardless of
+// which tool issued the remote call. Bash uses this directly (runBashRemote);
+// hosts building their own remote-eligible tools on top of RemoteRunner
+// (e.g. a plugin-package-backed custom tool) should use it too rather than
+// re-deriving the same formatting.
+func FormatRemoteResult(tc *ToolContext, res RemoteRunResult, timeout time.Duration) (Result, error) {
+	if res.Error != "" {
+		return Errorf("Error: " + res.Error), nil
+	}
+	output := res.Stdout + res.Stderr
+	if res.TimedOut {
+		if strings.TrimSpace(output) == "" {
+			output = "(no output)"
+		}
+		return Errorf(Capture(tc, output) + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
+	}
+	if res.ExitCode != 0 {
+		if strings.TrimSpace(output) == "" {
+			output = "(no output)"
+		}
+		return Errorf(Capture(tc, output) + fmt.Sprintf("\n\n[command exited with code %d]", res.ExitCode)), nil
+	}
+	if strings.TrimSpace(output) == "" {
+		return Text("(no output)"), nil
+	}
+	return Text(Capture(tc, output)), nil
 }
 
 // runBashManaged runs the command through the task manager, supporting explicit

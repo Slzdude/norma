@@ -56,6 +56,11 @@ type QueryInput struct {
 	// tool turns so the model learns when background work finishes.
 	Tasks *tool.Manager
 
+	// Remote, when non-nil, is threaded into every tool call's ToolContext.Remote
+	// (分布式执行器架构：远程执行会话绑定，见 tool.RemoteRunner)。nil = always
+	// local, unchanged default.
+	Remote tool.RemoteRunner
+
 	// Todos, when non-nil, enables todo system-reminders: when the model hasn't
 	// used TodoWrite for TodoReminderTurnsSinceWrite turns (and it's been at least
 	// TodoReminderTurnsBetweenReminder turns since the last reminder), the current

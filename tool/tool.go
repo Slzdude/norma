@@ -47,6 +47,12 @@ type ToolContext struct {
 	// DEBIAN_FRONTEND — see tool.nonInteractiveEnv), which override any value
 	// inherited for those four keys. Naming one here is how a host takes it back.
 	Env []string
+	// Remote, when non-nil, routes this session's remote-eligible tool calls
+	// (currently: Bash) to a distributed executor instead of a local subprocess
+	// (分布式执行器架构). nil = always local, today's unchanged behavior. Set
+	// once per session by the host — see RemoteRunner's doc comment for why a
+	// tool must opt in explicitly rather than this being a transparent swap.
+	Remote RemoteRunner
 }
 
 func (tc *ToolContext) progress(msg string) {
